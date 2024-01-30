@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Tuple, Uni
 
 import torch
 
-from outlines.fsm.fsm import FSMState
+from outlines.fsm.fsm import FSMState, Generate, Write
 
 if TYPE_CHECKING:
     from outlines.fsm.fsm import FSM
@@ -79,18 +79,45 @@ def sequence_generator(
     """
     token_ids, attention_masks, kv_cache = init_state
     while True:
-        allowed_tokens = get_allowed_tokens(fsms, fsm_states)
+        instructions = get_instructions(fsms, fsm_states)
 
-        next_token_ids, kv_cache, logits, _ = token_generator(
-            token_ids,
-            attention_masks,
-            kv_cache,
+        do_generate = torch.tensor(
+            [
+                True if isinstance(instruction, Generate) else False
+                for instruction in instructions
+            ]
+        )
+        generate_token_ids = token_ids[do_generate]
+        generate_attention_masks = token_ids[do_generate]
+        generate_kv_cache = tuple(
+            tuple(vv[~do_generate.to(vv.device)] for vv in v) for v in kv_cache
+        )
+
+        generate_next_token_ids, generate_kv_cache, logits, _ = token_generator(
+            generate_token_ids,
+            generate_attention_masks,
+            generate_kv_cache,
             rng=rng,
             allowed_tokens=allowed_tokens,
         )
+        append_token_ids = torch.tensor(
+            [
+                instruction.token_id
+                for instruction in instructions
+                if isinstance(instruction, Write)
+            ]
+        )
+
+        # Create a new tensor for the token ids
+        next_token_ids = torch.empty((batch_size, 1), device=token_ids.device)
+        next_token_ids[do_generate] = generate_next_token_ids
+        next_token_ids[~do_generate] = append_token_ids
 
         token_ids = update_token_ids(token_ids, next_token_ids)
         attention_masks = expand_attention_masks(attention_masks)
+        kv_cache = tuple(
+            tuple(vv[~do_generate.to(vv.device)] for vv in v) for v in past_key_values
+        )
 
         fsm_states = get_next_fsm_states(fsms, fsm_states, next_token_ids)
         is_finished = is_generation_finished(fsms, fsm_states)
@@ -172,7 +199,7 @@ def get_next_fsm_states(
     ]
 
 
-def get_allowed_tokens(fsms: List["FSM"], fsm_states: List[FSMState]) -> torch.Tensor:
+def get_instructions(fsms: List["FSM"], fsm_states: List[FSMState]) -> List[List[int]]:
     """Get the new instructions for each sequence from the finite-state machine.
 
     Parameters
@@ -187,7 +214,12 @@ def get_allowed_tokens(fsms: List["FSM"], fsm_states: List[FSMState]) -> torch.T
     A nested list that contains the ids of the logits to keep.
 
     """
-    return [fsm.allowed_token_ids(state) for fsm, state in zip(fsms, fsm_states)]
+    instructions: List[List[int]] = []
+    for fsm, state in zip(fsms, fsm_states):
+        instruction = fsm.get_next_instruction(state)
+        instructions.append(instruction)
+
+    return instructions
 
 
 def is_generation_finished(fsms: List["FSM"], fsm_states: List[FSMState]) -> bool:
